@@ -3,7 +3,8 @@
 
 Amended FWPs repeat the same pool, so zip counts would be inflated without
 deduping first. Unique loans keep one row per (issuer, loan_id), preferring
-the copy that has zip / FICO / LTV.
+the copy that has zip / FICO / LTV. Deal, zip, and state averages for FICO,
+LTV, CLTV, DTI, and rate are weighted by loan balance.
 
 Usage:
   python edgar_rmbs_aggregate.py
@@ -15,9 +16,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 NUM_COLS = ["fico", "cltv", "ltv", "dti", "current_balance", "orig_balance", "rate"]
+# Pool characteristics weighted by loan size. Balance itself stays unweighted.
+WEIGHT_COLS = ["fico", "ltv", "cltv", "dti", "rate"]
 RANGES = {
     "fico": (300, 850),
     "ltv": (1, 150),
@@ -82,30 +86,73 @@ def unique_loans(df):
     return out.drop(columns=["_keep"]).sort_values(["year", "issuer"]).reset_index(drop=True)
 
 
+def _loan_weight(frame):
+    """Original balance, or current balance when original is missing."""
+    orig = pd.to_numeric(frame["orig_balance"], errors="coerce")
+    curr = pd.to_numeric(frame.get("current_balance"), errors="coerce")
+    bal = orig.where(orig.notna(), curr)
+    return bal.where(bal > 0)
+
+
+def _wmean(frame, keys, col):
+    """Balance-weighted mean. Denominator is the balance of loans that have `col`."""
+    m = frame[col].notna() & frame["_w"].notna()
+    sub = frame.loc[m, [*keys, col, "_w"]]
+    if sub.empty:
+        return pd.Series(dtype=float, name=f"mean_{col}")
+    num = (sub[col] * sub["_w"]).groupby([sub[k] for k in keys], dropna=False).sum()
+    den = sub.groupby(keys, dropna=False)["_w"].sum()
+    return (num / den).rename(f"mean_{col}")
+
+
+def _wmedian(frame, keys, col):
+    """Smallest value at which cumulative balance reaches half the group's weight."""
+    m = frame[col].notna() & frame["_w"].notna()
+    sub = frame.loc[m, [*keys, col, "_w"]]
+    if sub.empty:
+        return pd.Series(dtype=float, name=f"med_{col}")
+    sub = sub.sort_values([*keys, col], kind="mergesort")
+    grouped = sub.groupby(keys, dropna=False, sort=False)["_w"]
+    cum = grouped.cumsum()
+    total = grouped.transform("sum")
+    hit = sub.loc[cum.to_numpy() >= total.to_numpy() / 2.0]
+    return hit.groupby(keys, dropna=False, sort=False)[col].first().rename(f"med_{col}")
+
+
 def _agg(frame, keys):
-    bal = frame["orig_balance"].where(frame["orig_balance"].notna(), frame["current_balance"])
-    frame = frame.assign(_bal=bal)
+    """Pool stats. FICO, LTV, CLTV, DTI, and rate are weighted by loan balance.
+
+    mean_balance and med_balance describe loan size and stay unweighted.
+    A loan with no positive balance is left out of the weighted stats.
+    """
+    frame = frame.copy()
+    frame["_w"] = _loan_weight(frame)
+    frame["_bal"] = frame["_w"]
     g = frame.groupby(keys, dropna=False)
     out = g.agg(
         n_loans=("accession", "size"),
         n_fico=("fico", "count"),
         n_ltv=("ltv", "count"),
         n_rate=("rate", "count"),
-        mean_fico=("fico", "mean"),
-        med_fico=("fico", "median"),
-        mean_ltv=("ltv", "mean"),
-        med_ltv=("ltv", "median"),
-        mean_cltv=("cltv", "mean"),
-        med_cltv=("cltv", "median"),
-        mean_dti=("dti", "mean"),
-        med_dti=("dti", "median"),
-        mean_rate=("rate", "mean"),
-        med_rate=("rate", "median"),
         mean_balance=("_bal", "mean"),
         med_balance=("_bal", "median"),
         sum_balance=("_bal", "sum"),
     )
-    return out.reset_index()
+    for col in WEIGHT_COLS:
+        if col not in frame.columns:
+            out[f"mean_{col}"] = np.nan
+            out[f"med_{col}"] = np.nan
+            continue
+        out[f"mean_{col}"] = _wmean(frame, keys, col)
+        out[f"med_{col}"] = _wmedian(frame, keys, col)
+    order = [
+        "n_loans", "n_fico", "n_ltv", "n_rate",
+        "mean_fico", "med_fico", "mean_ltv", "med_ltv",
+        "mean_cltv", "med_cltv", "mean_dti", "med_dti",
+        "mean_rate", "med_rate",
+        "mean_balance", "med_balance", "sum_balance",
+    ]
+    return out[order].reset_index()
 
 
 def zip_aggregates(df):
@@ -181,10 +228,10 @@ def main():
     print(f"Wrote {state_path} ({len(state):,} state-years)")
 
     deals = deal_aggregates(uniq)
-    deals = deals.loc[deals["n_zips"] > 0].copy()
+    deals = deals.loc[deals["n_zips"] > 100].copy()
     deals_path = out / "deals_rmbs_2006_2007.csv"
     deals.to_csv(deals_path, index=False)
-    print(f"Wrote {deals_path} ({len(deals):,} RMBS deals with zip)")
+    print(f"Wrote {deals_path} ({len(deals):,} RMBS deals with more than 100 zips)")
 
     print("\nUnique-loan coverage")
     for col in ["zip", "state", "fico", "ltv", "rate"]:
