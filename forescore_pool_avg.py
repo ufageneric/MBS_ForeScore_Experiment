@@ -15,7 +15,7 @@ range of the loan-level scores in that pool.
 
 Usage:
   python forescore_pool_avg.py
-  python forescore_pool_avg.py --deals edgar_rmbs/deals_rmbs_final.csv
+  python forescore_pool_avg.py --out output_file/deals_rmbs_final.csv
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ def main():
     ap.add_argument("--loans", default="edgar_rmbs/loans_rmbs_final.csv")
     ap.add_argument("--scores", default="edgar_rmbs/UFA_LS_FSZips_2605a.csv")
     ap.add_argument("--deals", default="edgar_rmbs/deals_rmbs_final.csv")
-    ap.add_argument("--out", default="edgar_rmbs/deals_rmbs_final.csv")
+    ap.add_argument("--out", default="output_file/deals_rmbs_final.csv")
     args = ap.parse_args()
 
     print(f"Loading {args.loans}")
@@ -165,7 +165,11 @@ def main():
     deals = deals.merge(averages, on="accession", how="left")
 
     out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     deals.to_csv(out, index=False)
+    deals_path = Path(args.deals)
+    if deals_path.resolve() != out.resolve():
+        deals.to_csv(deals_path, index=False)
     n_default = int(deals["forescore_default"].notna().sum())
     n_prepay = int(deals["forescore_prepayment"].notna().sum())
     print(f"Wrote {out} ({n_default:,} deals with a default score, "
