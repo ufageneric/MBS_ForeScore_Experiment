@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Balance-weighted pool average of ForeScore LifeOfLoanDefault.
+"""Balance-weighted pool averages of ForeScore life-of-loan default and prepayment.
 
 For each RMBS deal i and loan j in that deal:
 
-    sum_j (current_balance_ij * LifeOfLoanDefault_ij) / sum_j current_balance_ij
+    sum_j (balance_ij * score_ij) / sum_j balance_ij
 
-LifeOfLoanDefault is the ForeScore value for the loan's ZIP and origination
-month. A loan with no positive current balance, no origination date, or no
-matching ForeScore row is left out of both sums.
+score is LifeOfLoanDefault or LifeOfLoanPrepayment for the loan's ZIP and
+origination month. When the origination date is missing, the pool filing
+date is used. When the current balance is missing, the original balance is
+used. A loan with no positive balance, no usable date, or no matching
+ForeScore row is left out of both sums. Each pool also gets the min,
+25th percentile, median, 75th percentile, max, standard deviation, and
+range of the loan-level scores in that pool.
 
 Usage:
   python forescore_pool_avg.py
@@ -21,54 +25,108 @@ from pathlib import Path
 
 import pandas as pd
 
-SCORE_COLS = ["forescore_default", "forescore_n_loans", "forescore_balance"]
+SCORE_FIELDS = {
+    "forescore_default": "LifeOfLoanDefault",
+    "forescore_prepayment": "LifeOfLoanPrepayment",
+}
+DATE_FORMATS = ("%m/%d/%Y", "%Y%m%d", "%Y-%m-%d", "%m/%d/%y")
 
 
-def parse_orig_date(series):
-    """Tape dates arrive as M/D/YYYY or YYYYMMDD."""
+def parse_date(series):
+    """Tape dates arrive as M/D/YYYY, YYYYMMDD, or YYYY-MM-DD."""
     raw = series.fillna("").astype(str).str.strip()
-    parsed = pd.to_datetime(raw, errors="coerce")
-    ymd = pd.to_datetime(raw, format="%Y%m%d", errors="coerce")
-    return parsed.fillna(ymd)
+    parsed = pd.Series(pd.NaT, index=series.index)
+    for fmt in DATE_FORMATS:
+        parsed = parsed.fillna(pd.to_datetime(raw, format=fmt, errors="coerce"))
+    return parsed
 
 
 def load_forescore(path, years):
     parts = []
-    usecols = ["Year", "Month", "zipcode", "LifeOfLoanDefault"]
+    factor_cols = list(SCORE_FIELDS.values())
+    usecols = ["Year", "Month", "zipcode", *factor_cols]
     for chunk in pd.read_csv(path, usecols=usecols, chunksize=1_000_000):
         chunk = chunk.loc[chunk["Year"].isin(years)]
         if len(chunk):
             parts.append(chunk)
+    columns = ["Year", "Month", "zip_i", *factor_cols]
     if not parts:
-        return pd.DataFrame(columns=["Year", "Month", "zip_i", "LifeOfLoanDefault"])
+        return pd.DataFrame(columns=columns)
     scores = pd.concat(parts, ignore_index=True)
     scores["zip_i"] = pd.to_numeric(scores["zipcode"], errors="coerce")
-    scores["LifeOfLoanDefault"] = pd.to_numeric(scores["LifeOfLoanDefault"], errors="coerce")
-    scores = scores.dropna(subset=["zip_i", "LifeOfLoanDefault"])
-    return scores[["Year", "Month", "zip_i", "LifeOfLoanDefault"]]
+    for col in factor_cols:
+        scores[col] = pd.to_numeric(scores[col], errors="coerce")
+    scores = scores.dropna(subset=["zip_i"])
+    return scores[columns]
+
+
+def loan_weights(loans):
+    """Origination date, else filing date. Current balance, else original balance."""
+    frame = loans.copy()
+    orig = parse_date(frame["orig_date"])
+    filing = parse_date(frame["filing_date"])
+    frame["score_dt"] = orig.fillna(filing)
+    frame["used_filing_date"] = orig.isna() & frame["score_dt"].notna()
+
+    current = pd.to_numeric(frame["current_balance"], errors="coerce")
+    original = pd.to_numeric(frame["orig_balance"], errors="coerce")
+    frame["bal"] = current.where(current.gt(0), original.where(original.gt(0)))
+    frame["used_orig_balance"] = ~current.gt(0) & frame["bal"].notna()
+    frame["zip_i"] = pd.to_numeric(frame["zip"], errors="coerce")
+    return frame
 
 
 def pool_averages(loans, scores):
-    """One row per deal. Weight is current balance."""
-    frame = loans.copy()
-    frame["orig_dt"] = parse_orig_date(frame["orig_date"])
-    frame["bal"] = pd.to_numeric(frame["current_balance"], errors="coerce")
-    frame["zip_i"] = pd.to_numeric(frame["zip"], errors="coerce")
-    use = frame.loc[frame["orig_dt"].notna() & frame["bal"].gt(0) & frame["zip_i"].notna()].copy()
-    use["Year"] = use["orig_dt"].dt.year.astype(int)
-    use["Month"] = use["orig_dt"].dt.month.astype(int)
+    """One row per deal. Weight is current balance, or original balance."""
+    frame = loan_weights(loans)
+    use = frame.loc[frame["score_dt"].notna() & frame["bal"].notna() & frame["zip_i"].notna()].copy()
+    use["Year"] = use["score_dt"].dt.year.astype(int)
+    use["Month"] = use["score_dt"].dt.month.astype(int)
 
     matched = use.merge(scores, on=["Year", "Month", "zip_i"], how="left")
-    ok = matched.loc[matched["LifeOfLoanDefault"].notna()]
-    num = (ok["bal"] * ok["LifeOfLoanDefault"]).groupby(ok["accession"]).sum()
-    den = ok.groupby("accession")["bal"].sum()
-    cnt = ok.groupby("accession").size()
-    out = pd.DataFrame({
-        "forescore_default": num / den,
-        "forescore_n_loans": cnt,
-        "forescore_balance": den,
-    }).reset_index()
-    return out, len(use), int(matched["LifeOfLoanDefault"].isna().sum())
+    pieces = []
+    coverage = {"n_eligible": len(use)}
+    for name, col in SCORE_FIELDS.items():
+        ok = matched.loc[matched[col].notna()]
+        num = (ok["bal"] * ok[col]).groupby(ok["accession"]).sum()
+        den = ok.groupby("accession")["bal"].sum()
+        cnt = ok.groupby("accession").size()
+        grouped = ok.groupby("accession")[col]
+        piece = pd.DataFrame({
+            name: num / den,
+            f"{name}_min": grouped.min(),
+            f"{name}_p25": grouped.quantile(0.25),
+            f"{name}_median": grouped.median(),
+            f"{name}_p75": grouped.quantile(0.75),
+            f"{name}_max": grouped.max(),
+            f"{name}_std": grouped.std(),
+        })
+        piece[f"{name}_range"] = piece[f"{name}_max"] - piece[f"{name}_min"]
+        if name == "forescore_default":
+            piece["forescore_n_loans"] = cnt
+            piece["forescore_balance"] = den
+            coverage["n_unmatched"] = int(matched[col].isna().sum())
+            coverage["n_filing_date"] = int(ok["used_filing_date"].sum())
+            coverage["n_orig_balance"] = int(ok["used_orig_balance"].sum())
+        pieces.append(piece)
+    out = pd.concat(pieces, axis=1).reset_index()
+    return out, coverage
+
+
+def score_summary(scores):
+    """Deal-level distribution of a pool average ForeScore."""
+    values = scores.dropna()
+    return pd.Series({
+        "count": int(values.count()),
+        "mean": values.mean(),
+        "std": values.std(),
+        "min": values.min(),
+        "p25": values.quantile(0.25),
+        "median": values.median(),
+        "p75": values.quantile(0.75),
+        "max": values.max(),
+        "range": values.max() - values.min(),
+    })
 
 
 def main():
@@ -82,31 +140,48 @@ def main():
     print(f"Loading {args.loans}")
     loans = pd.read_csv(
         args.loans,
-        usecols=["accession", "zip", "orig_date", "current_balance"],
+        usecols=["accession", "zip", "orig_date", "filing_date", "current_balance", "orig_balance"],
         dtype={"accession": str},
         low_memory=False,
     )
-    dated = parse_orig_date(loans["orig_date"])
-    years = set(dated.dt.year.dropna().astype(int))
-    print(f"  {len(loans):,} loans, {dated.notna().sum():,} with an origination date")
+    weighted = loan_weights(loans)
+    years = set(weighted.loc[weighted["score_dt"].notna(), "score_dt"].dt.year.astype(int))
+    n_orig = int((~weighted["used_filing_date"] & weighted["score_dt"].notna()).sum())
+    print(f"  {len(loans):,} loans, {n_orig:,} with an origination date, "
+          f"{int(weighted['used_filing_date'].sum()):,} using the filing date")
 
     print(f"Loading {args.scores}")
     scores = load_forescore(args.scores, years)
-    print(f"  {len(scores):,} ZIP-month scores for origination years {min(years)}-{max(years)}")
+    print(f"  {len(scores):,} ZIP-month scores for {min(years)}-{max(years)}")
 
-    averages, n_weighted, n_unmatched = pool_averages(loans, scores)
-    print(f"  {n_weighted:,} loans with date and current balance, {n_unmatched:,} unmatched")
+    averages, coverage = pool_averages(loans, scores)
+    print(f"  {coverage['n_eligible']:,} loans with a date and a balance, "
+          f"{coverage['n_unmatched']:,} unmatched")
+    print(f"  matched loans using filing date: {coverage['n_filing_date']:,}")
+    print(f"  matched loans using original balance: {coverage['n_orig_balance']:,}")
 
     deals = pd.read_csv(args.deals, dtype={"accession": str})
-    deals = deals.drop(columns=[c for c in SCORE_COLS if c in deals.columns])
+    deals = deals.drop(columns=[c for c in deals.columns if c.startswith("forescore_")])
     deals = deals.merge(averages, on="accession", how="left")
 
     out = Path(args.out)
     deals.to_csv(out, index=False)
-    n_scored = int(deals["forescore_default"].notna().sum())
-    print(f"Wrote {out} ({n_scored:,} of {len(deals):,} deals with a ForeScore default)")
-    show = deals.loc[deals["forescore_default"].notna(), ["issuer", "forescore_n_loans", "forescore_default"]]
-    print(show.to_string(index=False))
+    n_default = int(deals["forescore_default"].notna().sum())
+    n_prepay = int(deals["forescore_prepayment"].notna().sum())
+    print(f"Wrote {out} ({n_default:,} deals with a default score, "
+          f"{n_prepay:,} with a prepayment score, of {len(deals):,})")
+    print("\nForeScore default across deals")
+    print(score_summary(deals["forescore_default"]).to_string())
+    print("\nForeScore prepayment across deals")
+    print(score_summary(deals["forescore_prepayment"]).to_string())
+    both = deals.dropna(subset=["forescore_default", "forescore_prepayment"])
+    if len(both) > 1:
+        corr = both["forescore_default"].corr(both["forescore_prepayment"])
+        print(f"\nCorrelation of the two pool scores: {corr:.3f}")
+    missing = deals.loc[deals["forescore_default"].isna(), "issuer"]
+    if len(missing):
+        print("\nDeals without a score")
+        print("\n".join(missing))
 
 
 if __name__ == "__main__":
