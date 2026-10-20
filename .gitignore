@@ -37,3 +37,5 @@ htmlcov/
 *~
 # Data too large to commit
 edgar_rmbs/
+data/hmda/*
+!data/hmda/.gitkeep
