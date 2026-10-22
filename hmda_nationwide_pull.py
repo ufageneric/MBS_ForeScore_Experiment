@@ -14,7 +14,10 @@ Census area built to match a ZIP code, not the USPS delivery boundary. Pass
 assign the ZIP that holds the most residential addresses instead.
 
 The nationwide CSV is tens of gigabytes. Files are written under data/hmda,
-which git does not track.
+which git does not track. The slim loan file then receives LifeOfLoanDefault
+and LifeOfLoanPrepayment for its ZIP and origination month. A second file
+rolls those loans up to the 11 Federal Home Loan Bank districts. The district
+score is sum(loan_amount × score) / sum(loan_amount).
 
 Usage:
   python hmda_nationwide_pull.py --year 2024
@@ -63,7 +66,8 @@ CENSUS_CROSSWALK = {
 EXACT_SHARE = 0.99
 
 # Public HMDA has no loan id, origination month, filing date, or current balance.
-# activity_year is the origination year. loan_amount is the original amount.
+# activity_year is the origination year. The slim file stores July 1 of that year.
+# loan_amount is the original amount.
 SLIM_COLS = [
     "activity_year",
     "loan_amount",
@@ -72,6 +76,43 @@ SLIM_COLS = [
     "zip_share",
     "zip_exact",
 ]
+FORESCORE_PATH = Path("edgar_rmbs/UFA_LS_FSZips_2605a.csv")
+FHLB_DIR = Path("output_file")
+SCORE_FIELDS = {
+    "forescore_default": "LifeOfLoanDefault",
+    "forescore_prepayment": "LifeOfLoanPrepayment",
+}
+SLIM_SCHEMA = pa.schema([
+    ("origination_date", pa.string()),
+    ("loan_amount", pa.float64()),
+    ("census_tract", pa.string()),
+    ("zipcode", pa.string()),
+    ("zip_share", pa.float64()),
+    ("zip_exact", pa.bool_()),
+    ("forescore_default", pa.float64()),
+    ("forescore_prepayment", pa.float64()),
+])
+
+# FHFA districts. A district does not split a state. Des Moines includes the
+# former Seattle district. There are 11 districts.
+FHLB_STATE = {
+    "01": "Atlanta", "11": "Atlanta", "12": "Atlanta", "13": "Atlanta",
+    "24": "Atlanta", "37": "Atlanta", "45": "Atlanta", "51": "Atlanta",
+    "09": "Boston", "23": "Boston", "25": "Boston", "33": "Boston",
+    "44": "Boston", "50": "Boston",
+    "17": "Chicago", "55": "Chicago",
+    "21": "Cincinnati", "39": "Cincinnati", "47": "Cincinnati",
+    "05": "Dallas", "22": "Dallas", "28": "Dallas", "35": "Dallas", "48": "Dallas",
+    "02": "Des Moines", "15": "Des Moines", "16": "Des Moines", "19": "Des Moines",
+    "27": "Des Moines", "29": "Des Moines", "30": "Des Moines", "38": "Des Moines",
+    "41": "Des Moines", "46": "Des Moines", "49": "Des Moines", "53": "Des Moines",
+    "56": "Des Moines", "60": "Des Moines", "66": "Des Moines", "69": "Des Moines",
+    "18": "Indianapolis", "26": "Indianapolis",
+    "34": "New York", "36": "New York", "72": "New York", "78": "New York",
+    "10": "Pittsburgh", "42": "Pittsburgh", "54": "Pittsburgh",
+    "04": "San Francisco", "06": "San Francisco", "32": "San Francisco",
+    "08": "Topeka", "20": "Topeka", "31": "Topeka", "40": "Topeka",
+}
 
 
 def build_url(year, conventional, first_lien):
@@ -240,15 +281,24 @@ def csv_to_parquet(csv_path, pq_path, crosswalk):
     return rows
 
 
+def _with_origination_date(table):
+    """Replace activity_year with July 1 of that year. ForeScore uses the month."""
+    year = table.column("activity_year").to_pandas().astype("string")
+    date = year + "-07-01"
+    date = date.where(year.str.fullmatch(r"\d{4}"))
+    out = table.drop_columns(["activity_year"])
+    return out.add_column(0, "origination_date", pa.array(date, type=pa.string()))
+
+
 def write_slim(pq_path, slim_pq, slim_csv):
-    """Keep origination year, original amount, tract, and the ZIP assignment."""
+    """Keep mid-year origination date, original amount, tract, and the ZIP assignment."""
     print(f"Writing {slim_pq.name} and {slim_csv.name}")
     reader = pq.ParquetFile(pq_path)
     writer = None
     header = True
     rows = 0
     for batch in reader.iter_batches(columns=SLIM_COLS, batch_size=500_000):
-        table = pa.Table.from_batches([batch])
+        table = _with_origination_date(pa.Table.from_batches([batch]))
         if writer is None:
             writer = pq.ParquetWriter(slim_pq, table.schema, compression="zstd")
         writer.write_table(table)
@@ -260,6 +310,154 @@ def write_slim(pq_path, slim_pq, slim_csv):
     if writer:
         writer.close()
     print(f"\nWrote {rows:,} loans")
+
+
+def _zip5(series):
+    digits = series.astype("string").str.replace(r"\D", "", regex=True).fillna("")
+    valid = digits.str.fullmatch(r"\d{1,5}")
+    return digits.str.zfill(5).where(valid)
+
+
+def load_forescore(path, years):
+    """Life-of-loan default and prepayment for the years these loans use."""
+    if not path.exists():
+        raise SystemExit(f"ForeScore file not found: {path}")
+    usecols = ["Year", "Month", "zipcode", *SCORE_FIELDS.values()]
+    parts = []
+    for chunk in pd.read_csv(path, usecols=usecols, chunksize=1_000_000):
+        chunk = chunk.loc[chunk["Year"].isin(years)]
+        if len(chunk):
+            parts.append(chunk)
+    if not parts:
+        raise SystemExit(f"No ForeScore rows for years {sorted(years)} in {path}")
+    scores = pd.concat(parts, ignore_index=True)
+    scores["zip5"] = _zip5(scores["zipcode"])
+    scores["Year"] = pd.to_numeric(scores["Year"], errors="coerce").astype("Int64")
+    scores["Month"] = pd.to_numeric(scores["Month"], errors="coerce").astype("Int64")
+    for col in SCORE_FIELDS.values():
+        scores[col] = pd.to_numeric(scores[col], errors="coerce")
+    scores = scores.dropna(subset=["zip5", "Year", "Month"])
+    scores = scores.drop_duplicates(["Year", "Month", "zip5"], keep="last")
+    print(f"ForeScore rows for {sorted(years)}: {len(scores):,}")
+    return scores.set_index(["Year", "Month", "zip5"])[list(SCORE_FIELDS.values())]
+
+
+def _score_years(pq_path):
+    years = set()
+    reader = pq.ParquetFile(pq_path)
+    for batch in reader.iter_batches(columns=["origination_date"], batch_size=500_000):
+        dates = pd.to_datetime(batch.column("origination_date").to_pandas(), errors="coerce")
+        years.update(int(y) for y in dates.dt.year.dropna().unique())
+    if not years:
+        raise SystemExit(f"No origination dates in {pq_path}")
+    return years
+
+
+def attach_scores_and_regions(slim_pq, slim_csv, region_csv, score_path):
+    """Add loan-level ForeScore columns and write the balance-weighted district file.
+
+    A loan with no ZIP, no positive amount, or no ForeScore row keeps a blank
+    score and is left out of the district sums.
+    """
+    print(f"Scoring {slim_pq.name}")
+    scores = load_forescore(score_path, _score_years(slim_pq))
+    reader = pq.ParquetFile(slim_pq)
+    tmp_pq = slim_pq.with_suffix(".parquet.scoring")
+    tmp_csv = slim_csv.with_suffix(".csv.scoring")
+    writer = None
+    header = True
+    rows = n_scored = 0
+    totals = {}
+
+    for batch in reader.iter_batches(batch_size=500_000):
+        frame = pa.Table.from_batches([batch]).to_pandas()
+        dates = pd.to_datetime(frame["origination_date"], errors="coerce")
+        frame["Year"] = dates.dt.year.astype("Int64")
+        frame["Month"] = dates.dt.month.astype("Int64")
+        frame["zip5"] = _zip5(frame["zipcode"])
+        matched = frame[["Year", "Month", "zip5"]].merge(
+            scores.reset_index(), on=["Year", "Month", "zip5"], how="left",
+        )
+        for name, col in SCORE_FIELDS.items():
+            frame[name] = matched[col].to_numpy()
+        digits = frame["census_tract"].astype("string").str.replace(r"\D", "", regex=True).fillna("")
+        state = digits.str.zfill(11).str[:2]
+        state = state.where(digits.str.fullmatch(r"\d{1,11}").fillna(False) & state.ne("00"))
+        frame_region = state.map(FHLB_STATE)
+        amount = pd.to_numeric(frame["loan_amount"], errors="coerce")
+        scored = frame["forescore_default"].notna() & amount.gt(0) & frame_region.notna()
+        _accumulate_regions(totals, frame_region, amount, frame, scored)
+
+        tract_ok = digits.str.fullmatch(r"\d{1,11}").fillna(False) & ~digits.str.fullmatch(r"0+").fillna(False)
+        frame["census_tract"] = digits.str.zfill(11).where(tract_ok)
+        frame["zipcode"] = frame["zip5"]
+        frame["origination_date"] = dates.dt.strftime("%Y-%m-%d").astype("string")
+        frame["loan_amount"] = amount
+        keep = frame[[
+            "origination_date", "loan_amount", "census_tract", "zipcode",
+            "zip_share", "zip_exact", "forescore_default", "forescore_prepayment",
+        ]]
+        table = pa.Table.from_pandas(keep, preserve_index=False, schema=SLIM_SCHEMA)
+        if writer is None:
+            writer = pq.ParquetWriter(tmp_pq, table.schema, compression="zstd")
+        else:
+            table = table.cast(writer.schema)
+        writer.write_table(table)
+        keep.to_csv(tmp_csv, mode="w" if header else "a", header=header, index=False)
+        header = False
+        rows += len(frame)
+        n_scored += int(frame["forescore_default"].notna().sum())
+        print(f"  {rows:,} rows", end="\r")
+
+    if writer:
+        writer.close()
+    tmp_pq.replace(slim_pq)
+    tmp_csv.replace(slim_csv)
+    print(f"\nWrote scores on {rows:,} loans ({n_scored:,} matched) to {slim_csv.name}")
+    write_region_file(totals, region_csv)
+
+
+def _accumulate_regions(totals, region, amount, frame, scored):
+    """Balance-weighted default and prepayment inside each FHLB district."""
+    work = pd.DataFrame({
+        "region": region,
+        "amount": amount,
+        "scored": scored,
+        "forescore_default": frame["forescore_default"],
+        "forescore_prepayment": frame["forescore_prepayment"],
+    })
+    work = work.loc[work["region"].notna()]
+    for name, part in work.groupby("region"):
+        row = totals.setdefault(name, {
+            "loans": 0, "scored_loans": 0, "balance": 0.0,
+            "default_num": 0.0, "prepay_num": 0.0,
+        })
+        row["loans"] += int(len(part))
+        ok = part.loc[part["scored"]]
+        row["scored_loans"] += int(len(ok))
+        row["balance"] += float(ok["amount"].sum())
+        row["default_num"] += float((ok["amount"] * ok["forescore_default"]).sum())
+        row["prepay_num"] += float((ok["amount"] * ok["forescore_prepayment"]).sum())
+
+
+def write_region_file(totals, region_csv):
+    """One row per FHLB district: sum(balance × score) / sum(balance)."""
+    rows = []
+    for region, row in totals.items():
+        balance = row["balance"]
+        rows.append({
+            "fhlb_region": region,
+            "loans": row["loans"],
+            "scored_loans": row["scored_loans"],
+            "balance": balance,
+            "forescore_default": row["default_num"] / balance if balance else None,
+            "forescore_prepayment": row["prepay_num"] / balance if balance else None,
+        })
+    out = pd.DataFrame(rows).sort_values("forescore_default", ascending=False)
+    region_csv.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(region_csv, index=False)
+    print(f"Wrote {len(out)} FHLB districts to {region_csv}")
+    print(out.to_string(index=False))
 
 
 def pc_sum_valid(column):
@@ -283,6 +481,10 @@ def main():
     ap.add_argument("--crosswalk", default=None,
                     help="HUD TRACT_ZIP csv/xlsx; default is the Census ZCTA file")
     ap.add_argument("--keep-csv", choices=["yes", "no"], default="yes")
+    ap.add_argument("--forescore", default=str(FORESCORE_PATH),
+                    help="ForeScore ZIP-month file")
+    ap.add_argument("--regions", default=None,
+                    help="FHLB district output CSV (default: output_file/hmda_YEAR_fhlb_regions.csv)")
     args = ap.parse_args()
 
     tag = "originations"
@@ -305,7 +507,11 @@ def main():
         print(f"Using existing {csv_path}")
 
     csv_to_parquet(csv_path, pq_path, crosswalk)
-    write_slim(pq_path, out / f"{stem}_slim.parquet", out / f"{stem}_slim.csv")
+    slim_pq = out / f"{stem}_slim.parquet"
+    slim_csv = out / f"{stem}_slim.csv"
+    write_slim(pq_path, slim_pq, slim_csv)
+    region_csv = Path(args.regions) if args.regions else FHLB_DIR / f"hmda_{args.year}_fhlb_regions.csv"
+    attach_scores_and_regions(slim_pq, slim_csv, region_csv, Path(args.forescore))
 
     if args.keep_csv == "no":
         csv_path.unlink()
